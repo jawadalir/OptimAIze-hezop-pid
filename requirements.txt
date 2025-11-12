@@ -1,4 +1,3 @@
---prefer-binary
 streamlit==1.39.0
 faiss-cpu==1.12.0
 sentence-transformers==3.1.1
