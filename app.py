@@ -1,9 +1,12 @@
+# app_streamlit_rag_agent.py
 import os
+import io
 import json
 import uuid
 import re
-from difflib import SequenceMatcher
+import hashlib
 from datetime import datetime
+from difflib import SequenceMatcher
 
 import faiss
 import numpy as np
@@ -11,59 +14,90 @@ import pdfplumber
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
-from tqdm import tqdm
+import httpx
 
-from dutch_to_eng import translate_pdf
+# Try to import translation helper (depends on PyMuPDF / fitz native libs)
+try:
+    from dutch_to_eng import translate_pdf
+    TRANSLATION_AVAILABLE = True
+    TRANSLATION_IMPORT_ERROR = None
+except (ImportError, OSError) as err:
+    TRANSLATION_AVAILABLE = False
+    TRANSLATION_IMPORT_ERROR = err
 
 # ==========================
-# 2) Streamlit App Config
-# ==========================
-st.set_page_config(page_title="PID + HAZOP RAG Chatbot", layout="wide")
-st.title("🧠 PID + HAZOP RAG Chatbot")
-
-# ==========================
-# 3) Env + OpenAI
+# Configuration
 # ==========================
 load_dotenv()
+
+# OpenAI client
 api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_AI_KEY")
 if not api_key:
     st.error("❌ No OpenAI API key found. Set OPENAI_API_KEY or OPEN_AI_KEY in your .env.")
     st.stop()
-client = OpenAI(api_key=api_key)
+http_client = httpx.Client(trust_env=False)
+client = OpenAI(api_key=api_key, http_client=http_client)
 
-# ==========================
-# 4) Data Sources and Paths
-# ==========================
+# Embedding model config
 EMBED_MODEL = "text-embedding-3-large"
-EMBED_DIM = 3072
-INDEX_PATH = "./rag_store/faiss.index"
-META_PATH = "./rag_store/metadata.json"
+EMBED_DIM = 3072  # same as model
+# Paths
+INDEX_DIR = "./rag_store"
+INDEX_PATH = os.path.join(INDEX_DIR, "faiss.index")
+META_PATH = os.path.join(INDEX_DIR, "metadata.json")
 CLASSIFIED_JSON = "classified_pipeline_tags2.json"
-os.makedirs("rag_store", exist_ok=True)
+os.makedirs(INDEX_DIR, exist_ok=True)
 os.makedirs("temp_pdfs", exist_ok=True)
 
-# Initialize session state for uploaded PDFs and chat history
-if "uploaded_pdfs" not in st.session_state:
-    st.session_state.uploaded_pdfs = []  # List of (original_name, translated_path) tuples
-if "display_history" not in st.session_state:
-    st.session_state.display_history = []  # Only current session chats
-if "agent_messages" not in st.session_state:
-    st.session_state.agent_messages = []
+# INPUT_PDFS: you can set either via env var "INPUT_PDFS" (comma-separated full paths)
+# or edit this list in-code (absolute or relative paths)
+INPUT_PDFS_ENV = os.getenv("INPUT_PDFS")
+if INPUT_PDFS_ENV:
+    INPUT_PDFS = [p.strip() for p in INPUT_PDFS_ENV.split(",") if p.strip()]
+else:
+    # default - update these to point to your local files (example names)
+    INPUT_PDFS = [
+        "hezop1.pdf",
+        "hezop2.pdf",
+        "hezop3.pdf",
+        # add more files or use env var
+    ]
+
+# session state initialization
 if "index_built" not in st.session_state:
     st.session_state.index_built = False
+if "agent_messages" not in st.session_state:
+    st.session_state.agent_messages = []
+if "display_history" not in st.session_state:
+    st.session_state.display_history = []
+if "uploaded_files_list" not in st.session_state:
+    # store tuples: (original_path, saved_input_path, translated_path, file_hash)
+    st.session_state.uploaded_files_list = []
 
 # ==========================
-# 5) Helpers: PDF + JSON → blocks
+# Utility helpers
 # ==========================
+def file_hash(path: str) -> str:
+    """Return sha256 hash for file contents (fast, deterministic)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 def extract_pdf_text(path: str):
     blocks = []
-    with pdfplumber.open(path) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            txt = page.extract_text() or ""
-            for ptxt in txt.split("\n\n"):
-                ptxt = ptxt.strip()
-                if ptxt:
-                    blocks.append({"text": ptxt, "source": os.path.basename(path), "page": i})
+    try:
+        with pdfplumber.open(path) as pdf:
+            for i, page in enumerate(pdf.pages, start=1):
+                txt = page.extract_text() or ""
+                # split by double newline blocks to keep paragraphs
+                for ptxt in txt.split("\n\n"):
+                    ptxt = ptxt.strip()
+                    if ptxt:
+                        blocks.append({"text": ptxt, "source": os.path.basename(path), "page": i})
+    except Exception as e:
+        st.warning(f"Could not extract text from {path}: {e}")
     return blocks
 
 def json_to_blocks(data):
@@ -100,71 +134,30 @@ def chunk_texts(blocks, max_chars=2500):
                 })
     return chunks
 
-def embed_text(text: str):
-    emb = client.embeddings.create(input=text, model=EMBED_MODEL).data[0].embedding
-    return np.array(emb, dtype="float32")
-
+def embed_texts(texts):
+    """Batch embed a list of texts and return a float32 numpy array."""
+    if not texts:
+        return np.zeros((0, EMBED_DIM), dtype="float32")
+    resp = client.embeddings.create(input=texts, model=EMBED_MODEL)
+    vecs = [r.embedding for r in resp.data]
+    arr = np.array(vecs, dtype="float32")
+    return arr
 
 # ==========================
-# 5b) Plant JSON helpers (from main.py)
+# Plant JSON loader (same as yours)
 # ==========================
 DATA = {}
 PIPELINES = {}
 PROCESS_DATA = {}
 TAG_TO_PIPELINES = {}
 
-
 def normalize_tag(tag: str) -> str:
     if not isinstance(tag, str):
         return ""
     return re.sub(r"[^a-zA-Z0-9]", "", tag).lower()
 
-
 def similarity(a, b):
     return SequenceMatcher(None, a, b).ratio()
-
-
-def find_best_tag_matches(query, data_list, threshold=0.6):
-    results = []
-    if not data_list:
-        return results
-
-    q_raw = query.lower()
-    q_norm = normalize_tag(query)
-
-    for item in data_list:
-        tag = item.get("Tag", "")
-        tag_lower = tag.lower()
-        tag_norm = normalize_tag(tag)
-
-        if tag_lower and tag_lower in q_raw:
-            results.append(item)
-            continue
-
-        if tag_norm and similarity(q_norm, tag_norm) >= threshold:
-            results.append(item)
-
-    return results
-
-
-def find_pipeline_matches(query, threshold=0.6):
-    q_raw = query.lower()
-    q_norm = normalize_tag(query)
-    matches = {}
-
-    for pipe_tag, pipe_info in PIPELINES.items():
-        tag_lower = pipe_tag.lower()
-        tag_norm = normalize_tag(pipe_tag)
-
-        if tag_lower in q_raw:
-            matches[pipe_tag] = pipe_info
-            continue
-
-        if similarity(q_norm, tag_norm) >= threshold:
-            matches[pipe_tag] = pipe_info
-
-    return matches
-
 
 def build_tag_index(pipelines):
     index = {}
@@ -173,43 +166,308 @@ def build_tag_index(pipelines):
             step_tag = step.get("tag")
             details = step.get("details") or {}
             detail_tag = details.get("Tag")
-
             for t in {step_tag, detail_tag}:
                 if not t:
                     continue
                 norm = normalize_tag(t)
                 index.setdefault(norm, set()).add(pipe_tag)
-
     return index
 
+def load_plant_data():
+    global DATA, PIPELINES, PROCESS_DATA, TAG_TO_PIPELINES
+    if not os.path.exists(CLASSIFIED_JSON):
+        st.warning(f"⚠️ Missing plant JSON: {CLASSIFIED_JSON}")
+        DATA = {}
+        PIPELINES = {}
+        PROCESS_DATA = {}
+        TAG_TO_PIPELINES = {}
+        return {}
+    try:
+        with open(CLASSIFIED_JSON, "r", encoding="utf-8") as f:
+            DATA = json.load(f)
+    except json.JSONDecodeError:
+        st.error("❌ 'classified_pipeline_tags2.json' is not valid JSON.")
+        st.stop()
+    PIPELINES = DATA.get("complete_pipeline_flows", {}) or {}
+    PROCESS_DATA = DATA.get("process_data", {}) or {}
+    TAG_TO_PIPELINES = build_tag_index(PIPELINES)
+    return DATA
+
+DATA = load_plant_data()
+
+# ==========================
+# Index & metadata helpers (dedupe-aware)
+# ==========================
+def load_index_and_metas():
+    if os.path.exists(INDEX_PATH) and os.path.exists(META_PATH):
+        try:
+            idx = faiss.read_index(INDEX_PATH)
+            metas = json.load(open(META_PATH, "r", encoding="utf-8"))
+            return idx, metas
+        except Exception as e:
+            st.warning(f"Failed to load existing index/metas: {e}")
+    return None, []
+
+def save_index_and_metas(index, metas):
+    faiss.write_index(index, INDEX_PATH)
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump(metas, f, indent=2)
+
+def ensure_index(dim=EMBED_DIM):
+    """Create a new index if none exists and return it."""
+    idx, metas = load_index_and_metas()
+    if idx is None:
+        idx = faiss.IndexFlatIP(dim)
+        metas = []
+        save_index_and_metas(idx, metas)
+    return idx, metas
+
+def get_existing_file_hashes(metas):
+    """Return set of file_hash values present in metadata."""
+    hashes = set()
+    for m in metas:
+        fh = m.get("file_hash")
+        if fh:
+            hashes.add(fh)
+    return hashes
+
+# ==========================
+# Input files processing (auto ingest)
+# ==========================
+def prepare_input_files(input_list):
+    """
+    Ensure input files exist, copy to temp folder (to avoid locking originals),
+    compute file hashes, and create translated paths.
+    Store into session_state.uploaded_files_list as tuples:
+    (original_path, saved_input_path, translated_path, file_hash)
+    """
+    prepared = []
+    for path in input_list:
+        if not os.path.exists(path):
+            st.warning(f"Input file not found: {path}")
+            continue
+        # save a local copy to temp_pdfs to normalize path names
+        base = os.path.basename(path)
+        saved_input_path = os.path.join("temp_pdfs", f"input_{uuid.uuid4().hex}_{base}")
+        # only copy if not already present (compare by file size or name)
+        if not os.path.exists(saved_input_path):
+            with open(path, "rb") as src, open(saved_input_path, "wb") as dst:
+                dst.write(src.read())
+        fh = file_hash(saved_input_path)
+        translated_name = f"{os.path.splitext(base)[0]}_translated.pdf"
+        translated_path = os.path.join("temp_pdfs", f"translated_{fh}_{translated_name}")
+        prepared.append((path, saved_input_path, translated_path, fh))
+    # update session state
+    st.session_state.uploaded_files_list = prepared
+    return prepared
+
+# ==========================
+# Build / update FAISS index with dedupe
+# ==========================
+def build_or_update_index(force_rebuild=False, translate_if_needed=True, chunk_size=2500):
+    """
+    Key behavior:
+    - Loads existing index + metas (if any).
+    - Computes which input files are already present using file_hash in metas.
+    - For new files: extract text, chunk, embed in batches, and append vectors to FAISS index (no full rebuild).
+    - Also optionally includes the CLASSIFIED_JSON as a source (only once).
+    """
+    if not st.session_state.uploaded_files_list and not os.path.exists(CLASSIFIED_JSON):
+        st.warning("No input files provided and no classified JSON present. Nothing to index.")
+        return None, None
+
+    # load index (or create)
+    index, metas = load_index_and_metas()
+    if index is None or force_rebuild:
+        index = faiss.IndexFlatIP(EMBED_DIM)
+        metas = []
+
+    existing_hashes = get_existing_file_hashes(metas)
+
+    if translate_if_needed and not TRANSLATION_AVAILABLE:
+        st.warning(
+            "PDF translation disabled because the translation module failed to import.\n"
+            "Please reinstall PyMuPDF (pip install --force-reinstall PyMuPDF==1.24.10) "
+            "or install the Microsoft Visual C++ Redistributable for Visual Studio 2015-2022."
+        )
+
+    # collect all new chunks
+    new_chunks = []
+    for original_path, saved_input_path, translated_path, fh in st.session_state.uploaded_files_list:
+        if fh in existing_hashes and not force_rebuild:
+            st.info(f"Skipping embedding for {os.path.basename(original_path)} — already indexed.")
+            continue
+
+        # translate if requested
+        if translate_if_needed and TRANSLATION_AVAILABLE:
+            try:
+                if not os.path.exists(translated_path):
+                    st.info(f"Translating {original_path} ...")
+                    # your translate_pdf signature: translate_pdf(input_path, translated_path, chunk_size=..., ...)
+                    translate_pdf(saved_input_path, translated_path, chunk_size=1000, max_retries=3, timeout=30)
+                    st.success(f"Translated: {os.path.basename(original_path)}")
+            except Exception as e:
+                st.warning(f"Translation error for {original_path}: {e}. Proceeding with original file.")
+                translated_path = saved_input_path
+        elif translate_if_needed and not TRANSLATION_AVAILABLE:
+            translated_path = saved_input_path
+
+        # fallback to original if translated file missing
+        src_for_text = translated_path if os.path.exists(translated_path) else saved_input_path
+        blocks = extract_pdf_text(src_for_text)
+        # tag each chunk with file_hash for dedupe detection later
+        chunks = chunk_texts(blocks, max_chars=chunk_size)
+        for c in chunks:
+            c["file_hash"] = fh
+            c["original_path"] = os.path.basename(original_path)
+        new_chunks.extend(chunks)
+
+    # also include classified JSON blocks only if not already included (we tag them with a synthetic hash)
+    if os.path.exists(CLASSIFIED_JSON):
+        with open(CLASSIFIED_JSON, "r", encoding="utf-8") as f:
+            plant_data = json.load(f)
+        classified_blocks = json_to_blocks(plant_data)
+        # synthetic hash for classified json (use file modified time)
+        try:
+            mtime = os.path.getmtime(CLASSIFIED_JSON)
+            cj_hash = hashlib.sha256(f"{CLASSIFIED_JSON}-{mtime}".encode()).hexdigest()
+        except:
+            cj_hash = hashlib.sha256(CLASSIFIED_JSON.encode()).hexdigest()
+        if cj_hash not in existing_hashes or force_rebuild:
+            for b in classified_blocks:
+                b["file_hash"] = cj_hash
+                b["original_path"] = os.path.basename(CLASSIFIED_JSON)
+            new_chunks.extend(classified_blocks)
+        else:
+            st.info("Classified JSON already indexed — skipping.")
+
+    if not new_chunks:
+        st.success("Index is up-to-date. Nothing new to embed.")
+        # return loaded index and metas if available
+        if index is not None and metas is not None and len(metas) > 0:
+            st.session_state.index_built = True
+            return index, metas
+        else:
+            return None, None
+
+    # embed in batches (to avoid huge single request)
+    BATCH = 16
+    text_batches = [new_chunks[i:i+BATCH] for i in range(0, len(new_chunks), BATCH)]
+    vectors_to_add = []
+    new_metas = []
+    for batch in text_batches:
+        texts = [c["text"] for c in batch]
+        arr = embed_texts(texts)
+        if arr.size == 0:
+            continue
+        # normalize vectors for cosine similarity using inner product
+        faiss.normalize_L2(arr)
+        vectors_to_add.append(arr)
+        # build metas for these chunks
+        for i, c in enumerate(batch):
+            meta = {
+                "chunk_id": str(uuid.uuid4()),
+                "text": c["text"],
+                "source": c.get("source", c.get("original_path", "unknown")),
+                "page": c.get("page"),
+                "created": datetime.utcnow().isoformat(),
+                "file_hash": c.get("file_hash"),
+            }
+            new_metas.append(meta)
+
+    # finally add vectors to index (append)
+    if vectors_to_add:
+        all_new = np.vstack(vectors_to_add)
+        if index.ntotal == 0:
+            # index is empty - create and add
+            index.add(all_new)
+        else:
+            index.add(all_new)
+
+        # extend metas list and save
+        metas.extend(new_metas)
+        save_index_and_metas(index, metas)
+        st.success(f"Added {len(new_metas)} chunks to FAISS index.")
+        st.session_state.index_built = True
+        return index, metas
+
+    return None, None
+
+# ==========================
+# Retrieval & agentic tool
+# ==========================
+def embed_query(q):
+    emb = client.embeddings.create(input=q, model=EMBED_MODEL).data[0].embedding
+    v = np.array(emb, dtype="float32").reshape(1, -1)
+    faiss.normalize_L2(v)
+    return v
+
+def retrieve(index, metas, query, topk=6):
+    if index is None or metas is None or index.ntotal == 0:
+        return []
+    v = embed_query(query)
+    D, I = index.search(v, topk)
+    results = []
+    for n, i in enumerate(I[0]):
+        if i >= 0 and i < len(metas):
+            meta = metas[i]
+            score = float(D[0][n])
+            results.append((meta, score))
+    return results
+
+# Minimal local context builders (kept from original code)
+def find_best_tag_matches(query, data_list, threshold=0.6):
+    results = []
+    if not data_list:
+        return results
+    q_raw = query.lower()
+    q_norm = normalize_tag(query)
+    for item in data_list:
+        tag = item.get("Tag", "")
+        tag_lower = tag.lower()
+        tag_norm = normalize_tag(tag)
+        if tag_lower and tag_lower in q_raw:
+            results.append(item)
+            continue
+        if tag_norm and similarity(q_norm, tag_norm) >= threshold:
+            results.append(item)
+    return results
+
+def find_pipeline_matches(query, threshold=0.6):
+    q_raw = query.lower()
+    q_norm = normalize_tag(query)
+    matches = {}
+    for pipe_tag, pipe_info in PIPELINES.items():
+        tag_lower = pipe_tag.lower()
+        tag_norm = normalize_tag(pipe_tag)
+        if tag_lower in q_raw:
+            matches[pipe_tag] = pipe_info
+            continue
+        if similarity(q_norm, tag_norm) >= threshold:
+            matches[pipe_tag] = pipe_info
+    return matches
 
 def find_pipelines_for_tag(tag_query: str, threshold: float = 0.7):
     results = {}
     if not tag_query:
         return results
-
     q_norm = normalize_tag(tag_query)
     if not q_norm:
         return results
-
     direct = TAG_TO_PIPELINES.get(q_norm, set())
     for p_tag in direct:
         if p_tag in PIPELINES:
             results[p_tag] = PIPELINES[p_tag]
-
     for t_norm, pipe_ids in TAG_TO_PIPELINES.items():
         if t_norm in q_norm or q_norm in t_norm or similarity(q_norm, t_norm) >= threshold:
             for p_tag in pipe_ids:
                 if p_tag in PIPELINES:
                     results[p_tag] = PIPELINES[p_tag]
-
     return results
-
 
 def build_local_context(query):
     context = {"equipment": [], "instrumentation": [], "handvalves": [], "pipelines": {}}
     q = query.lower()
-
     if any(word in q for word in ["pipeline", "line", "flow path", "pipe"]):
         context["pipelines"] = PIPELINES
     elif any(word in q for word in ["equipment", "pump", "tank", "vessel", "reactor"]):
@@ -249,10 +507,8 @@ def build_local_context(query):
 
     return context
 
-
 def summarize_context(context):
     lines = []
-
     if context["equipment"]:
         lines.append("Equipment:")
         for e in context["equipment"]:
@@ -260,7 +516,6 @@ def summarize_context(context):
             typ = e.get("Type", "")
             spec = e.get("EquipmentSpec", "")
             lines.append(f"- {tag} (type {typ}): spec = {spec}")
-
     if context["instrumentation"]:
         lines.append("Instrumentation:")
         for i in context["instrumentation"]:
@@ -268,7 +523,6 @@ def summarize_context(context):
             typ = i.get("Type", "")
             details = i.get("Details", "")
             lines.append(f"- {tag} (type {typ}): details = {details}")
-
     if context["handvalves"]:
         lines.append("Hand valves:")
         for h in context["handvalves"]:
@@ -276,7 +530,6 @@ def summarize_context(context):
             code = h.get("Code", h.get("ValveCode", ""))
             normally = h.get("Normally", "")
             lines.append(f"- {tag} (code {code}, normally {normally})")
-
     if context["pipelines"]:
         lines.append("Pipelines:")
         for tag, info in context["pipelines"].items():
@@ -285,7 +538,6 @@ def summarize_context(context):
             s_tag = (start.get("details") or {}).get("Tag") or start.get("tag", "unknown")
             e_tag = (end.get("details") or {}).get("Tag") or end.get("tag", "unknown")
             lines.append(f"- {tag}: from {s_tag} to {e_tag}")
-
             flow = info.get("complete_flow", [])
             for step in flow:
                 if step.get("category") == "node":
@@ -302,239 +554,39 @@ def summarize_context(context):
                     hv_tag = hv_details.get("Tag") or step.get("tag", "")
                     if hv_tag:
                         lines.append(f"  • handvalve '{hv_tag}' is on pipeline {tag}")
-
     if not lines:
         return "No matching data found in plant model."
-
     return "\n".join(lines)
 
 # ==========================
-# 6) Build / Load FAISS Index
+# Agentic tool: get_react_context
 # ==========================
-def build_or_load_index(data, uploaded_pdfs_list):
-    # Check if we have uploaded PDFs to process
-    if not uploaded_pdfs_list and not st.session_state.index_built:
-        # If no PDFs uploaded and index doesn't exist, return None
-        return None, None
-    
-    # If index already built and exists, try to load it first
-    if st.session_state.index_built and os.path.exists(INDEX_PATH) and os.path.exists(META_PATH):
-        try:
-            # Verify that all current PDFs are in the index
-            existing_metas = json.load(open(META_PATH, "r", encoding="utf-8"))
-            existing_sources = {meta.get("source", "") for meta in existing_metas}
-            current_sources = {os.path.basename(translated) for _, translated in uploaded_pdfs_list}
-            
-            # If all current PDFs are already in the index, just load it
-            if current_sources.issubset(existing_sources) and len(current_sources) > 0:
-                # Index is up to date, just load it
-                index = faiss.read_index(INDEX_PATH)
-                metas = json.load(open(META_PATH, "r", encoding="utf-8"))
-                return index, metas
-        except Exception as e:
-            st.warning(f"⚠️ Error loading existing index: {e}. Rebuilding...")
+def get_react_context(question: str, top_k: int = 6) -> str:
+    local_context = build_local_context(question)
+    summary = summarize_context(local_context)
 
-    # If we get here, we need to build/rebuild the index
-    all_blocks = []
-    
-    # From uploaded and translated PDFs
-    for original_name, translated_path in uploaded_pdfs_list:
-        if os.path.exists(translated_path):
-            all_blocks += extract_pdf_text(translated_path)
-        else:
-            st.warning(f"⚠️ Missing translated file: {translated_path}")
-
-    # From classified JSON (if exists)
-    if os.path.exists(CLASSIFIED_JSON):
-        all_blocks += json_to_blocks(data)
-
-    if not all_blocks:
-        st.warning("⚠️ No content available to build the vector index. Please upload PDFs first.")
-        return None, None
-
-    # Chunk and embed
-    chunks = chunk_texts(all_blocks)
-    vecs = []
-    for c in chunks:
-        vecs.append(embed_text(c["text"]))
-    vecs = np.vstack(vecs) if vecs else np.zeros((0, EMBED_DIM), dtype="float32")
-    if vecs.size == 0:
-        st.error("No content available to build the vector index.")
-        return None, None
-    faiss.normalize_L2(vecs)
-
-    index = faiss.IndexFlatIP(EMBED_DIM)
-    index.add(vecs)
-
-    metas = [
-        {
-            "chunk_id": str(uuid.uuid4()),
-            "text": c["text"],
-            "source": c["source"],
-            "page": c.get("page"),
-            "created": datetime.utcnow().isoformat(),
-        }
-        for c in chunks
-    ]
-
-    faiss.write_index(index, INDEX_PATH)
-    json.dump(metas, open(META_PATH, "w", encoding="utf-8"), indent=2)
-    st.session_state.index_built = True
-    return index, metas
-
-def load_plant_data():
-    global DATA, PIPELINES, PROCESS_DATA, TAG_TO_PIPELINES
-
-    if not os.path.exists(CLASSIFIED_JSON):
-        st.warning(f"⚠️ Missing plant JSON: {CLASSIFIED_JSON}")
-        DATA = {}
-        PIPELINES = {}
-        PROCESS_DATA = {}
-        TAG_TO_PIPELINES = {}
-        return {}
-
-    try:
-        with open(CLASSIFIED_JSON, "r", encoding="utf-8") as f:
-            DATA = json.load(f)
-    except json.JSONDecodeError:
-        st.error("❌ 'classified_pipeline_tags2.json' is not valid JSON.")
-        st.stop()
-    except OSError as exc:
-        st.error(f"❌ Unable to read {CLASSIFIED_JSON}: {exc}")
-        st.stop()
-
-    PIPELINES = DATA.get("complete_pipeline_flows", {}) or {}
-    PROCESS_DATA = DATA.get("process_data", {}) or {}
-    TAG_TO_PIPELINES = build_tag_index(PIPELINES)
-
-    return DATA
-
-
-DATA = load_plant_data()
-
-# ==========================
-# PDF Upload and Processing Section
-# ==========================
-st.sidebar.header("📄 Document Upload")
-st.sidebar.markdown("Upload Dutch PDF files to process and add to the knowledge base.")
-
-uploaded_file = st.sidebar.file_uploader(
-    "Choose a Dutch PDF file",
-    type=["pdf"],
-    help="Upload a PDF file in Dutch. It will be translated and processed."
-)
-
-if uploaded_file is not None:
-    # Show uploaded file info
-    st.sidebar.success(f"✅ File uploaded: {uploaded_file.name}")
-    
-    # Check if file is already in the list
-    file_names = [name for name, _, _ in st.session_state.uploaded_pdfs]
-    if uploaded_file.name not in file_names:
-        # Save uploaded file temporarily
-        temp_input_path = os.path.join("temp_pdfs", f"input_{uuid.uuid4().hex}_{uploaded_file.name}")
-        with open(temp_input_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
-        # Generate translated file path
-        translated_name = f"{os.path.splitext(uploaded_file.name)[0]}_translated.pdf"
-        temp_translated_path = os.path.join("temp_pdfs", f"translated_{uuid.uuid4().hex}_{translated_name}")
-        
-        # Add to list (not processed yet)
-        st.session_state.uploaded_pdfs.append((uploaded_file.name, temp_input_path, temp_translated_path))
-        st.sidebar.info(f"📋 Added to queue: {uploaded_file.name}")
-        st.rerun()
-
-# Show list of uploaded files
-if st.session_state.uploaded_pdfs:
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Uploaded Files:")
-    for i, (original_name, input_path, translated_path) in enumerate(st.session_state.uploaded_pdfs):
-        status = "✅ Translated" if os.path.exists(translated_path) else "⏳ Pending"
-        st.sidebar.text(f"{i+1}. {original_name} - {status}")
-    
-    # Check if index needs rebuilding
-    processed_pdfs = [(name, translated) for name, _, translated in st.session_state.uploaded_pdfs if os.path.exists(translated)]
-    needs_rebuild = False
-    if processed_pdfs:
-        # Check if index exists and contains all current PDFs
-        if os.path.exists(META_PATH):
-            try:
-                existing_metas = json.load(open(META_PATH, "r", encoding="utf-8"))
-                existing_sources = {meta.get("source", "") for meta in existing_metas}
-                current_sources = {os.path.basename(translated) for _, translated in processed_pdfs}
-                # Check if all current PDFs are in the index
-                if not current_sources.issubset(existing_sources):
-                    needs_rebuild = True
-            except:
-                needs_rebuild = True
-        else:
-            needs_rebuild = True
+    # retrieve from vector store
+    idx, metas = load_index_and_metas()
+    retrieved = retrieve(idx, metas, question, topk=top_k) if idx is not None else []
+    if retrieved:
+        retrieve_lines = ["Retrieved references:"]
+        for meta, score in retrieved:
+            snippet = meta["text"].strip().replace("\n", " ")
+            snippet = snippet[:400] + ("..." if len(snippet) > 400 else "")
+            source = meta.get("source", "unknown")
+            page = meta.get("page")
+            score_pct = f"{score:.2f}"
+            page_info = f" p.{page}" if page else ""
+            retrieve_lines.append(f"- [{source}{page_info}] (score {score_pct}): {snippet}")
+        retrieved_text = "\n".join(retrieve_lines)
     else:
-        needs_rebuild = False
-    
-    # Process Document button
-    if st.sidebar.button("🔄 Process Documents", type="primary"):
-        with st.sidebar:
-            with st.spinner("Processing documents..."):
-                translation_done = False
-                # Translate all queued PDFs (only if not already translated)
-                for original_name, input_path, translated_path in st.session_state.uploaded_pdfs:
-                    if os.path.exists(translated_path):
-                        st.info(f"⏭️ Skipping {original_name} - already translated")
-                        continue
-                    
-                    st.info(f"Translating {original_name}...")
-                    try:
-                        # Use smaller chunks (1000) for faster translation and less timeout risk
-                        translate_pdf(input_path, translated_path, chunk_size=1000, max_retries=3, timeout=30)
-                        st.success(f"✅ Translated: {original_name}")
-                        translation_done = True
-                    except Exception as e:
-                        error_msg = str(e)
-                        st.error(f"❌ Error translating {original_name}")
-                        if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
-                            st.warning("⏱️ Translation timed out. The function will retry automatically. If it fails completely, try processing again - it will skip already translated chunks.")
-                        else:
-                            st.warning(f"💡 Error: {error_msg[:150]}. Try processing again.")
-                
-                # Rebuild index only if needed
-                if translation_done or needs_rebuild:
-                    st.info("Rebuilding vector index...")
-                    st.session_state.index_built = False  # Force rebuild
-                else:
-                    st.info("⏭️ Skipping index rebuild - already up to date")
-                
-                st.rerun()
+        retrieved_text = "Retrieved references: none found."
 
-# Build or load index
-processed_pdfs = [(name, translated) for name, _, translated in st.session_state.uploaded_pdfs if os.path.exists(translated)]
-index, metas = build_or_load_index(DATA, processed_pdfs)
+    combined = f"Local plant context:\n{summary}\n\n{retrieved_text}"
+    return combined.strip()
 
 # ==========================
-# 7) Retrieval utilities
-# ==========================
-def embed_query(q):
-    v = embed_text(q).reshape(1, -1)
-    faiss.normalize_L2(v)
-    return v
-
-def retrieve(q, topk=6):
-    if index is None or metas is None:
-        return []
-
-    v = embed_query(q)
-    D, I = index.search(v, topk)
-    results = []
-    for n, i in enumerate(I[0]):
-        if i >= 0 and i < len(metas):
-            results.append((metas[i], float(D[0][n])))
-    return results
-
-# Chat history is now only in session state (memory), not loaded from file
-
-# ==========================
-# 9) Chat UI + ReAct-style system
+# Chat/Agent orchestration
 # ==========================
 react_system = {
     "role": "system",
@@ -558,62 +610,36 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "The user question needing plant context.",
-                    },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Number of retrieval chunks to include.",
-                        "default": 6,
-                    },
+                    "question": {"type": "string"},
+                    "top_k": {"type": "integer", "default": 6},
                 },
                 "required": ["question"],
             },
-        },
+        }
     }
 ]
-
-
-def get_react_context(question: str, top_k: int = 6) -> str:
-    local_context = build_local_context(question)
-    summary = summarize_context(local_context)
-
-    retrieved = retrieve(question, topk=top_k)
-    if retrieved:
-        retrieve_lines = ["Retrieved references:"]
-        for meta, score in retrieved:
-            snippet = meta["text"].strip().replace("\n", " ")
-            snippet = snippet[:400] + ("..." if len(snippet) > 400 else "")
-            source = meta.get("source", "unknown")
-            page = meta.get("page")
-            score_pct = f"{score:.2f}"
-            page_info = f" p.{page}" if page else ""
-            retrieve_lines.append(f"- [{source}{page_info}] (score {score_pct}): {snippet}")
-        retrieved_text = "\n".join(retrieve_lines)
-    else:
-        retrieved_text = "Retrieved references: none found."
-
-    combined = f"Local plant context:\n{summary}\n\n{retrieved_text}"
-    return combined.strip()
-
 
 def ensure_agent_initialized():
     if not st.session_state.agent_messages:
         st.session_state.agent_messages.append(react_system)
-
 
 def append_display_message(role, content):
     st.session_state.display_history.append(
         {"role": role, "content": content, "time": datetime.utcnow().isoformat()}
     )
 
-
 def call_react_agent():
+    """
+    Agent loop:
+    - Sends messages to LLM (gpt-4o).
+    - Model may request tool calls (get_react_context).
+    - When tool call is present, we run it synchronously and append result as a tool message.
+    - Continue until model returns final response (no tool_calls).
+    """
     ensure_agent_initialized()
     messages = st.session_state.agent_messages
-
     while True:
+        # call the model
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
@@ -622,11 +648,7 @@ def call_react_agent():
             tool_choice="auto",
         )
         message = response.choices[0].message
-
-        assistant_entry = {
-            "role": "assistant",
-            "content": message.content or "",
-        }
+        assistant_entry = {"role": "assistant", "content": message.content or ""}
         if message.tool_calls:
             assistant_entry["tool_calls"] = [
                 {
@@ -641,56 +663,116 @@ def call_react_agent():
             ]
         messages.append(assistant_entry)
 
+        # if model did not call tools, we have final answer
         if not message.tool_calls:
             return message.content or "I couldn't generate a response."
 
+        # otherwise handle each tool call
         for tool_call in message.tool_calls:
             if tool_call.type != "function":
                 continue
-
-            function_name = tool_call.function.name
+            fname = tool_call.function.name
             try:
                 args = json.loads(tool_call.function.arguments or "{}")
-            except json.JSONDecodeError:
+            except:
                 args = {}
-
-            if function_name == "get_react_context":
-                question = args.get("question", "")
-                top_k = args.get("top_k", 6)
-                tool_result = get_react_context(question, top_k=top_k)
+            if fname == "get_react_context":
+                q = args.get("question", "")
+                top_k = int(args.get("top_k", 6))
+                tool_result = get_react_context(q, top_k=top_k)
             else:
-                tool_result = "Unsupported tool requested."
+                tool_result = f"Unsupported tool requested: {fname}"
 
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": function_name,
-                    "content": tool_result,
-                }
-            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "name": fname,
+                "content": tool_result,
+            })
 
+# ==========================
+# Streamlit UI
+# ==========================
+st.set_page_config(page_title="PID + HAZOP RAG Agent (Auto Input)", layout="wide")
+st.title("🧠 PID + HAZOP RAG Agent (auto-input)")
 
-# Display only current session conversation (from memory)
-for msg in st.session_state.display_history:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# Check if index is available before allowing chat
-if index is None or metas is None:
-    st.warning("⚠️ Please upload and process at least one PDF document before starting a chat.")
-    st.info("Use the sidebar to upload Dutch PDF files and click 'Process Documents' to build the knowledge base.")
+# show configured input files
+st.sidebar.header("Input files (auto)")
+st.sidebar.markdown("Files specified inside the app or via env var INPUT_PDFS (comma-separated).")
+if INPUT_PDFS:
+    st.sidebar.markdown("**Configured input files:**")
+    for p in INPUT_PDFS:
+        st.sidebar.text(p)
 else:
-    user_q = st.chat_input("Ask about pipelines, equipment, instruments, or HAZOP findings...")
+    st.sidebar.warning("No input files configured. Set env var INPUT_PDFS or edit the script.")
 
+# prepare input files (copy to temp and compute hash)
+prepared = prepare_input_files(INPUT_PDFS)
+
+# show list of prepared files
+if prepared:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Prepared files")
+    for orig, saved, translated, fh in prepared:
+        status = "translated" if os.path.exists(translated) else "pending-translation"
+        st.sidebar.text(f"- {os.path.basename(orig)} (hash: {fh[:8]}...) - {status}")
+
+# Index building controls
+col1, col2, col3 = st.sidebar.columns([1,1,1])
+with col1:
+    if st.button("▶️ Build / Update Index"):
+        with st.spinner("Building or updating index (dedupe-aware)..."):
+            idx, metas = build_or_update_index(force_rebuild=False, translate_if_needed=True)
+            if idx is not None:
+                st.success("Index ready.")
+            else:
+                st.warning("Index build/update did not produce an index.")
+with col2:
+    if st.button("🔁 Force Rebuild Index"):
+        with st.spinner("Force rebuilding full index..."):
+            # force: remove existing files then rebuild
+            try:
+                if os.path.exists(INDEX_PATH):
+                    os.remove(INDEX_PATH)
+                if os.path.exists(META_PATH):
+                    os.remove(META_PATH)
+            except Exception as e:
+                st.warning(f"Could not remove existing store: {e}")
+            idx, metas = build_or_update_index(force_rebuild=True, translate_if_needed=True)
+            if idx:
+                st.success("Index force-rebuilt.")
+with col3:
+    if st.button("🧾 Show metadata summary"):
+        idx, metas = load_index_and_metas()
+        if metas:
+            st.write(f"Total chunks: {len(metas)}")
+            # show top 5 metas
+            st.write(metas[:5])
+        else:
+            st.info("No metadata found yet.")
+
+# Load index in memory for chat if available
+index, metas = load_index_and_metas()
+
+if index is None or len(metas) == 0:
+    st.warning("⚠️ No vector index available. Build/update index first (sidebar).")
+    st.info("Use 'Build / Update Index' to embed configured files automatically.")
+else:
+    # chat interface
+    user_q = st.chat_input("Ask about pipelines, equipment, instruments, or HAZOP findings...")
     if user_q:
         append_display_message("user", user_q)
         st.session_state.agent_messages.append({"role": "user", "content": user_q})
-
         try:
             reply = call_react_agent()
         except Exception as e:
             reply = f"⚠️ Error calling GPT: {e}"
-
         append_display_message("assistant", reply)
-        st.rerun()
+        # st.experimental_rerun()
+
+# show conversation
+st.markdown("---")
+st.header("Session conversation")
+for msg in st.session_state.display_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
