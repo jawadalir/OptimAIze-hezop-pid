@@ -1,11 +1,12 @@
+--prefer-binary
 streamlit==1.39.0
-faiss-cpu==1.8.0
+faiss-cpu==1.12.0
 sentence-transformers==3.1.1
 pdfplumber==0.11.4
 openai==1.47.0
 deep-translator==1.11.4
 numpy==1.26.4
-tiktoken>=0.6.0
+tiktoken==0.8.0
 python-dotenv==1.0.1
 tqdm==4.66.5
 httpx==0.28.1
