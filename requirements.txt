@@ -5,7 +5,7 @@ pdfplumber==0.11.4
 openai==1.47.0
 deep-translator==1.11.4
 numpy==1.26.4
-tiktoken==0.5.2
+tiktoken==0.4.0
 python-dotenv==1.0.1
 tqdm==4.66.5
 httpx==0.28.1
