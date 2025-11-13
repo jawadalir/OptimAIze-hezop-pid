@@ -2,6 +2,11 @@ streamlit==1.39.0
 pinecone==4.0.0
 numpy==1.26.4
 pdfplumber==0.11.4
+PyMuPDF==1.24.10
 openai==1.47.0
 httpx==0.28.1
 python-dotenv==1.0.1
+deep-translator==1.11.4
+requests==2.32.3
+urllib3==2.2.3
+reportlab==4.2.5
