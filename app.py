@@ -4,7 +4,6 @@ import json
 import uuid
 import re
 import hashlib
-import tempfile
 from datetime import datetime
 from difflib import SequenceMatcher
 
@@ -14,17 +13,13 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import httpx
 
-try:
-    from embedding import (  # type: ignore[import]
-        PINECONE_IMPORT_ERROR,
-        get_pinecone_index,
-        load_metas,
-        normalize_vector,
-        pinecone_index_ready,
-    )
-except ImportError as e:
-    st.error(f"❌ Failed to import embedding module: {e}")
-    st.stop()
+from embedding import (  # type: ignore[import]
+    PINECONE_IMPORT_ERROR,
+    get_pinecone_index,
+    load_metas,
+    normalize_vector,
+    pinecone_index_ready,
+)
 
 # ==========================
 # Configuration
@@ -34,33 +29,23 @@ load_dotenv()
 # Streamlit page config must be called before any other Streamlit command
 st.set_page_config(page_title="PID + HAZOP RAG Agent (auto-input)", layout="wide")
 
-# OpenAI client - USING st.secrets
-try:
-    api_key = st.secrets.get("OPENAI_API_KEY") or st.secrets.get("OPEN_AI_KEY")
-    if not api_key:
-        st.error("❌ No OpenAI API key found in secrets. Please set OPENAI_API_KEY in Streamlit secrets.")
-        st.stop()
-    
-    http_client = httpx.Client(trust_env=False)
-    client = OpenAI(api_key=api_key, http_client=http_client)
-    
-except Exception as e:
-    st.error(f"❌ Error setting up OpenAI client: {e}")
+# OpenAI client
+api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_AI_KEY")
+if not api_key:
+    st.error("❌ No OpenAI API key found. Set OPENAI_API_KEY or OPEN_AI_KEY in your .env.")
     st.stop()
+http_client = httpx.Client(trust_env=False)
+client = OpenAI(api_key=api_key, http_client=http_client)
 
 # Embedding model config
 EMBED_MODEL = "text-embedding-3-large"
 EMBED_DIM = 3072  # same as model
 
-# Paths - USING TEMP DIRS
-INDEX_DIR = tempfile.mkdtemp()
+# Paths
+INDEX_DIR = "./rag_store"
 META_PATH = os.path.join(INDEX_DIR, "metadata.json")
 CLASSIFIED_JSON = "classified_pipeline_tags2.json"
-
-# Check for required files
-if not os.path.exists(CLASSIFIED_JSON):
-    st.sidebar.warning(f"⚠️ Missing file: {CLASSIFIED_JSON}")
-
+os.makedirs(INDEX_DIR, exist_ok=True)
 os.makedirs("temp_pdfs", exist_ok=True)
 
 # session state initialization
@@ -124,7 +109,6 @@ def load_plant_data():
 
 
 load_plant_data()
-
 # ==========================
 # Retrieval & agentic tool
 # ==========================
@@ -140,12 +124,7 @@ def retrieve(query, topk=6):
     query_vec = embed_query(query)
     if query_vec.size == 0:
         return []
-    
     pinecone_index = get_pinecone_index(EMBED_DIM)
-    if pinecone_index is None:
-        st.error("❌ Failed to get Pinecone index")
-        return []
-        
     try:
         response = pinecone_index.query(
             vector=query_vec.tolist(),
@@ -167,7 +146,6 @@ def retrieve(query, topk=6):
             score = None
         results.append((meta, score))
     return results
-
 # Minimal local context builders (kept from original code)
 def find_best_tag_matches(query, data_list, threshold=0.6):
     results = []
@@ -448,40 +426,28 @@ def call_react_agent():
 st.title("🧠 PID + HAZOP RAG Agent (auto-input)")
 
 st.sidebar.header("Vector Index Status")
-try:
-    metas = load_metas(META_PATH)
-    if metas:
-        st.sidebar.success(f"{len(metas)} chunks cached from Pinecone.")
+metas = load_metas(META_PATH)
+if metas:
+    st.sidebar.success(f"{len(metas)} chunks cached from Pinecone.")
+else:
+    if pinecone_index_ready(EMBED_DIM):
+        st.sidebar.info("Vectors found in Pinecone (metadata cache empty).")
     else:
-        if pinecone_index_ready(EMBED_DIM):
-            st.sidebar.info("Vectors found in Pinecone (metadata cache empty).")
-        else:
-            st.sidebar.warning("No vectors detected in Pinecone for this index.")
-except Exception as e:
-    st.sidebar.warning(f"Could not check index status: {e}")
-
-# Check if Pinecone is ready
-try:
-    pinecone_ready = pinecone_index_ready(EMBED_DIM)
-except Exception as e:
-    st.error(f"❌ Error checking Pinecone: {e}")
-    pinecone_ready = False
+        st.sidebar.warning("No vectors detected in Pinecone for this index.")
 
 # chat interface
-if pinecone_ready:
+if pinecone_index_ready(EMBED_DIM):
     user_q = st.chat_input("Ask about pipelines, equipment, instruments, or HAZOP findings...")
     if user_q:
         append_display_message("user", user_q)
         st.session_state.agent_messages.append({"role": "user", "content": user_q})
         try:
-            with st.spinner("Thinking..."):
-                reply = call_react_agent()
+            reply = call_react_agent()
         except Exception as e:
             reply = f"⚠️ Error calling GPT: {e}"
         append_display_message("assistant", reply)
-        st.rerun()
 else:
-    st.warning("⚠️ Pinecone index is empty or not accessible. Run `python embedding.py` to ingest PDFs.")
+    st.warning("⚠️ Pinecone index is empty. Run `python embedding.py` to ingest PDFs.")
 
 st.markdown("---")
 st.header("Session conversation")
