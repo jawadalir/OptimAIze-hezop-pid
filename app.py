@@ -8,31 +8,18 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 import numpy as np
-import pdfplumber
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 import httpx
 
-from embedding import (
+from embedding import (  # type: ignore[import]
     PINECONE_IMPORT_ERROR,
     get_pinecone_index,
-    get_existing_file_hashes,
     load_metas,
     normalize_vector,
-    normalize_vectors,
     pinecone_index_ready,
-    save_metas,
 )
-
-# Try to import translation helper (depends on PyMuPDF / fitz native libs)
-try:
-    from dutch_to_eng import translate_pdf
-    TRANSLATION_AVAILABLE = True
-    TRANSLATION_IMPORT_ERROR = None
-except (ImportError, OSError) as err:
-    TRANSLATION_AVAILABLE = False
-    TRANSLATION_IMPORT_ERROR = err
 
 # ==========================
 # Configuration
@@ -61,114 +48,30 @@ CLASSIFIED_JSON = "classified_pipeline_tags2.json"
 os.makedirs(INDEX_DIR, exist_ok=True)
 os.makedirs("temp_pdfs", exist_ok=True)
 
-# INPUT_PDFS: you can set either via env var "INPUT_PDFS" (comma-separated full paths)
-# or edit this list in-code (absolute or relative paths)
-INPUT_PDFS_ENV = os.getenv("INPUT_PDFS")
-if INPUT_PDFS_ENV:
-    INPUT_PDFS = [p.strip() for p in INPUT_PDFS_ENV.split(",") if p.strip()]
-else:
-    # default - update these to point to your local files (example names)
-    INPUT_PDFS = [
-        "hezop1.pdf",
-        "hezop2.pdf",
-        "hezop3.pdf",
-        # add more files or use env var
-    ]
-
 # session state initialization
-if "index_built" not in st.session_state:
-    st.session_state.index_built = False
 if "agent_messages" not in st.session_state:
     st.session_state.agent_messages = []
 if "display_history" not in st.session_state:
     st.session_state.display_history = []
-if "uploaded_files_list" not in st.session_state:
-    # store tuples: (original_path, saved_input_path, translated_path, file_hash)
-    st.session_state.uploaded_files_list = []
 
 # ==========================
-# Utility helpers
-# ==========================
-def file_hash(path: str) -> str:
-    """Return sha256 hash for file contents (fast, deterministic)."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def extract_pdf_text(path: str):
-    blocks = []
-    try:
-        with pdfplumber.open(path) as pdf:
-            for i, page in enumerate(pdf.pages, start=1):
-                txt = page.extract_text() or ""
-                # split by double newline blocks to keep paragraphs
-                for ptxt in txt.split("\n\n"):
-                    ptxt = ptxt.strip()
-                    if ptxt:
-                        blocks.append({"text": ptxt, "source": os.path.basename(path), "page": i})
-    except Exception as e:
-        st.warning(f"Could not extract text from {path}: {e}")
-    return blocks
-
-def json_to_blocks(data):
-    source_name = os.path.basename(CLASSIFIED_JSON)
-    blocks = []
-    # Pipelines
-    for tag, flow in data.get("complete_pipeline_flows", {}).items():
-        desc = [f"Pipeline {tag}:"]
-        start_tag = flow.get("start", {}).get("tag")
-        end_tag = flow.get("end", {}).get("tag")
-        desc.append(f"Starts at {start_tag}, ends at {end_tag}.")
-        for step in flow.get("complete_flow", []):
-            desc.append(f"- {step.get('tag')} ({step.get('category')})")
-        blocks.append({"text": "\n".join(desc), "source": source_name})
-    # Process data
-    for cat in ["Equipment", "Instrumentation", "HandValves"]:
-        for item in data.get("process_data", {}).get(cat, []):
-            spec = item.get("EquipmentSpec") or item.get("Details") or ""
-            line = f"{cat} {item.get('Tag')} ({item.get('Type')}): {spec}"
-            blocks.append({"text": line, "source": source_name})
-    return blocks
-
-def chunk_texts(blocks, max_chars=2500):
-    chunks = []
-    for b in blocks:
-        txt = b["text"]
-        for i in range(0, len(txt), max_chars):
-            part = txt[i:i+max_chars]
-            if len(part.strip()) > 50:
-                chunks.append({
-                    "text": part,
-                    "source": b.get("source", "pdf"),
-                    "page": b.get("page"),
-                })
-    return chunks
-
-def embed_texts(texts):
-    """Batch embed a list of texts and return a float32 numpy array."""
-    if not texts:
-        return np.zeros((0, EMBED_DIM), dtype="float32")
-    resp = client.embeddings.create(input=texts, model=EMBED_MODEL)
-    vecs = [r.embedding for r in resp.data]
-    arr = np.array(vecs, dtype="float32")
-    return arr
-# ==========================
-# Plant JSON loader (same as yours)
+# Plant metadata loading
 # ==========================
 DATA = {}
 PIPELINES = {}
 PROCESS_DATA = {}
 TAG_TO_PIPELINES = {}
 
+
 def normalize_tag(tag: str) -> str:
     if not isinstance(tag, str):
         return ""
     return re.sub(r"[^a-zA-Z0-9]", "", tag).lower()
 
+
 def similarity(a, b):
     return SequenceMatcher(None, a, b).ratio()
+
 
 def build_tag_index(pipelines):
     index = {}
@@ -184,10 +87,10 @@ def build_tag_index(pipelines):
                 index.setdefault(norm, set()).add(pipe_tag)
     return index
 
+
 def load_plant_data():
     global DATA, PIPELINES, PROCESS_DATA, TAG_TO_PIPELINES
     if not os.path.exists(CLASSIFIED_JSON):
-        st.warning(f"⚠️ Missing plant JSON: {CLASSIFIED_JSON}")
         DATA = {}
         PIPELINES = {}
         PROCESS_DATA = {}
@@ -204,174 +107,8 @@ def load_plant_data():
     TAG_TO_PIPELINES = build_tag_index(PIPELINES)
     return DATA
 
-DATA = load_plant_data()
 
-# ==========================
-# Input files processing (auto ingest)
-# ==========================
-def prepare_input_files(input_list):
-    """
-    Ensure input files exist, copy to temp folder (to avoid locking originals),
-    compute file hashes, and create translated paths.
-    Store into session_state.uploaded_files_list as tuples:
-    (original_path, saved_input_path, translated_path, file_hash)
-    """
-    prepared = []
-    for path in input_list:
-        if not os.path.exists(path):
-            st.warning(f"Input file not found: {path}")
-            continue
-        # save a local copy to temp_pdfs to normalize path names
-        base = os.path.basename(path)
-        saved_input_path = os.path.join("temp_pdfs", f"input_{uuid.uuid4().hex}_{base}")
-        # only copy if not already present (compare by file size or name)
-        if not os.path.exists(saved_input_path):
-            with open(path, "rb") as src, open(saved_input_path, "wb") as dst:
-                dst.write(src.read())
-        fh = file_hash(saved_input_path)
-        translated_name = f"{os.path.splitext(base)[0]}_translated.pdf"
-        translated_path = os.path.join("temp_pdfs", f"translated_{fh}_{translated_name}")
-        prepared.append((path, saved_input_path, translated_path, fh))
-    # update session state
-    st.session_state.uploaded_files_list = prepared
-    return prepared
-
-# ==========================
-# Build / update Pinecone index with dedupe
-# ==========================
-def build_or_update_index(force_rebuild=False, translate_if_needed=True, chunk_size=2500):
-    """
-    - Loads cached metadata (local JSON) for dedupe.
-    - Optionally clears the Pinecone index on force rebuild.
-    - For new files: extract text, chunk, embed, and upsert into Pinecone.
-    - Also optionally includes the CLASSIFIED_JSON as a source (only once).
-    """
-    if not st.session_state.uploaded_files_list and not os.path.exists(CLASSIFIED_JSON):
-        st.warning("No input files provided and no classified JSON present. Nothing to index.")
-        return []
-
-    pinecone_index = get_pinecone_index(EMBED_DIM)
-    metas = []
-    if force_rebuild:
-        try:
-            pinecone_index.delete(delete_all=True)
-            st.info("Cleared Pinecone index before rebuilding.")
-        except Exception as e:
-            st.warning(f"Failed to clear Pinecone index: {e}")
-        save_metas(META_PATH, [])
-    else:
-        metas = load_metas(META_PATH)
-
-    existing_hashes = get_existing_file_hashes(metas)
-
-    if translate_if_needed and not TRANSLATION_AVAILABLE:
-        st.info(
-            "Optional PDF translation is disabled because the translation helper (PyMuPDF + reportlab + deep-translator) "
-            "is not installed. The app will continue with original PDFs. Install these packages if you need on-the-fly "
-            "Dutch → English translation."
-        )
-
-    new_chunks = []
-    for original_path, saved_input_path, translated_path, fh in st.session_state.uploaded_files_list:
-        if fh in existing_hashes and not force_rebuild:
-            st.info(f"Skipping embedding for {os.path.basename(original_path)} — already indexed.")
-            continue
-
-        if translate_if_needed and TRANSLATION_AVAILABLE:
-            try:
-                if not os.path.exists(translated_path):
-                    st.info(f"Translating {original_path} ...")
-                    translate_pdf(saved_input_path, translated_path, chunk_size=1000, max_retries=3, timeout=30)
-                    st.success(f"Translated: {os.path.basename(original_path)}")
-            except Exception as e:
-                st.warning(f"Translation error for {original_path}: {e}. Proceeding with original file.")
-                translated_path = saved_input_path
-        elif translate_if_needed and not TRANSLATION_AVAILABLE:
-            translated_path = saved_input_path
-
-        src_for_text = translated_path if os.path.exists(translated_path) else saved_input_path
-        blocks = extract_pdf_text(src_for_text)
-        chunks = chunk_texts(blocks, max_chars=chunk_size)
-        for c in chunks:
-            c["file_hash"] = fh
-            c["original_path"] = os.path.basename(original_path)
-            c["chunk_id"] = str(uuid.uuid4())
-        new_chunks.extend(chunks)
-
-    if os.path.exists(CLASSIFIED_JSON):
-        with open(CLASSIFIED_JSON, "r", encoding="utf-8") as f:
-            plant_data = json.load(f)
-        classified_blocks = json_to_blocks(plant_data)
-        try:
-            mtime = os.path.getmtime(CLASSIFIED_JSON)
-            cj_hash = hashlib.sha256(f"{CLASSIFIED_JSON}-{mtime}".encode()).hexdigest()
-        except Exception:
-            cj_hash = hashlib.sha256(CLASSIFIED_JSON.encode()).hexdigest()
-        if cj_hash not in existing_hashes or force_rebuild:
-            for b in classified_blocks:
-                b["file_hash"] = cj_hash
-                b["original_path"] = os.path.basename(CLASSIFIED_JSON)
-                b["chunk_id"] = str(uuid.uuid4())
-            new_chunks.extend(classified_blocks)
-        else:
-            st.info("Classified JSON already indexed — skipping.")
-
-    if not new_chunks:
-        st.success("Index is up-to-date. Nothing new to embed.")
-        if metas:
-            st.session_state.index_built = True
-        return metas
-
-    BATCH = 16
-    text_batches = [new_chunks[i:i + BATCH] for i in range(0, len(new_chunks), BATCH)]
-    new_metas = []
-    upserted = 0
-
-    for batch in text_batches:
-        texts = [c["text"] for c in batch]
-        arr = embed_texts(texts)
-        arr = normalize_vectors(arr)
-        if arr.size == 0:
-            continue
-
-        items = []
-        batch_metas = []
-        for vec, c in zip(arr, batch):
-            meta = {
-                "chunk_id": c["chunk_id"],
-                "text": c["text"],
-                "source": c.get("source", c.get("original_path", "unknown")),
-                "page": c.get("page"),
-                "created": datetime.utcnow().isoformat(),
-                "file_hash": c.get("file_hash"),
-                "original_path": c.get("original_path"),
-            }
-            items.append(
-                {
-                    "id": c["chunk_id"],
-                    "values": vec.tolist(),
-                    "metadata": meta,
-                }
-            )
-            batch_metas.append(meta)
-
-        try:
-            pinecone_index.upsert(items=items)
-            upserted += len(items)
-            new_metas.extend(batch_metas)
-        except Exception as e:
-            st.error(f"Failed to upsert batch into Pinecone: {e}")
-
-    if upserted > 0:
-        metas.extend(new_metas)
-        save_metas(META_PATH, metas)
-        st.success(f"Added {upserted} chunks to Pinecone index.")
-        st.session_state.index_built = True
-    else:
-        st.warning("No chunks were added to Pinecone.")
-
-    return metas
-
+load_plant_data()
 # ==========================
 # Retrieval & agentic tool
 # ==========================
@@ -688,63 +425,18 @@ def call_react_agent():
 # ==========================
 st.title("🧠 PID + HAZOP RAG Agent (auto-input)")
 
-# show configured input files
-st.sidebar.header("Input files (auto)")
-st.sidebar.markdown("Files specified inside the app or via env var INPUT_PDFS (comma-separated).")
-if INPUT_PDFS:
-    st.sidebar.markdown("**Configured input files:**")
-    for p in INPUT_PDFS:
-        st.sidebar.text(p)
-else:
-    st.sidebar.warning("No input files configured. Set env var INPUT_PDFS or edit the script.")
-
-# prepare input files (copy to temp and compute hash)
-prepared = prepare_input_files(INPUT_PDFS)
-
-# show list of prepared files
-if prepared:
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Prepared files")
-    for orig, saved, translated, fh in prepared:
-        status = "translated" if os.path.exists(translated) else "pending-translation"
-        st.sidebar.text(f"- {os.path.basename(orig)} (hash: {fh[:8]}...) - {status}")
-
-# Index building controls
-col1, col2, col3 = st.sidebar.columns([1,1,1])
-with col1:
-    if st.button("▶️ Build / Update Index"):
-        with st.spinner("Building or updating index (dedupe-aware)..."):
-            metas = build_or_update_index(force_rebuild=False, translate_if_needed=True)
-            if metas:
-                st.success("Index ready.")
-            else:
-                st.warning("Index build/update did not add any new chunks.")
-with col2:
-    if st.button("🔁 Force Rebuild Index"):
-        with st.spinner("Force rebuilding full index..."):
-            metas = build_or_update_index(force_rebuild=True, translate_if_needed=True)
-            if metas:
-                st.success("Index force-rebuilt.")
-with col3:
-    if st.button("🧾 Show metadata summary"):
-        metas = load_metas(META_PATH)
-        if metas:
-            st.write(f"Total chunks: {len(metas)}")
-            # show top 5 metas
-            st.write(metas[:5])
-        else:
-            st.info("No metadata found yet.")
-
-# Load metadata cache to decide whether index is populated
+st.sidebar.header("Vector Index Status")
 metas = load_metas(META_PATH)
-
-if not metas and not pinecone_index_ready(EMBED_DIM):
-    st.warning("⚠️ No vector index available. Build/update index first (sidebar).")
-    st.info("Use 'Build / Update Index' to embed configured files automatically.")
+if metas:
+    st.sidebar.success(f"{len(metas)} chunks cached from Pinecone.")
 else:
-    if not metas:
-        st.info("Metadata cache empty — relying on Pinecone index metadata only.")
-    # chat interface
+    if pinecone_index_ready(EMBED_DIM):
+        st.sidebar.info("Vectors found in Pinecone (metadata cache empty).")
+    else:
+        st.sidebar.warning("No vectors detected in Pinecone for this index.")
+
+# chat interface
+if pinecone_index_ready(EMBED_DIM):
     user_q = st.chat_input("Ask about pipelines, equipment, instruments, or HAZOP findings...")
     if user_q:
         append_display_message("user", user_q)
@@ -754,9 +446,9 @@ else:
         except Exception as e:
             reply = f"⚠️ Error calling GPT: {e}"
         append_display_message("assistant", reply)
-        # st.experimental_rerun()
+else:
+    st.warning("⚠️ Pinecone index is empty. Run `python embedding.py` to ingest PDFs.")
 
-# show conversation
 st.markdown("---")
 st.header("Session conversation")
 for msg in st.session_state.display_history:
