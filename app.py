@@ -1,6 +1,5 @@
 # app_streamlit_rag_agent.py
 import os
-import io
 import json
 import uuid
 import re
@@ -15,7 +14,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import httpx
 try:
-    from pinecone import Pinecone, ServerlessSpec  # type: ignore[import]
+    from pinecone import Pinecone, ServerlessSpec
     PINECONE_IMPORT_ERROR = None
 except ImportError as err:
     Pinecone = None  # type: ignore[assignment]
@@ -36,6 +35,9 @@ except (ImportError, OSError) as err:
 # ==========================
 load_dotenv()
 
+# Streamlit page config must be called before any other Streamlit command
+st.set_page_config(page_title="PID + HAZOP RAG Agent (auto-input)", layout="wide")
+
 # OpenAI client
 api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_AI_KEY")
 if not api_key:
@@ -48,52 +50,6 @@ client = OpenAI(api_key=api_key, http_client=http_client)
 EMBED_MODEL = "text-embedding-3-large"
 EMBED_DIM = 3072  # same as model
 
-# Pinecone client
-if PINECONE_IMPORT_ERROR:
-    st.error(
-        f"❌ Pinecone SDK not available: {PINECONE_IMPORT_ERROR}. "
-        "Install it with 'pip install pinecone-client'."
-    )
-    st.stop()
-pinecone_api_key = os.getenv("PINECONE_API_KEY")
-if not pinecone_api_key:
-    st.error("❌ No Pinecone API key found. Set PINECONE_API_KEY in your .env.")
-    st.stop()
-pinecone_cloud = os.getenv("PINECONE_CLOUD", "aws")
-pinecone_region = (
-    os.getenv("PINECONE_ENVIRONMENT")
-    or os.getenv("PINECONE_REGION")
-    or "us-east-1"
-)
-pinecone_index_name = os.getenv("PINECONE_INDEX_NAME", "hezop-rag")
-
-pinecone_client = Pinecone(api_key=pinecone_api_key)
-try:
-    listed = pinecone_client.list_indexes()
-    if hasattr(listed, "names"):
-        existing_indexes = set(listed.names())
-    elif hasattr(listed, "indexes"):
-        existing_indexes = {getattr(idx, "name", None) for idx in listed.indexes}
-    else:
-        existing_indexes = {getattr(idx, "name", idx) for idx in listed}
-except Exception as e:
-    st.error(f"❌ Failed to list Pinecone indexes: {e}")
-    st.stop()
-
-if pinecone_index_name not in existing_indexes:
-    try:
-        pinecone_client.create_index(
-            name=pinecone_index_name,
-            dimension=EMBED_DIM,
-            metric="cosine",
-            spec=ServerlessSpec(cloud=pinecone_cloud, region=pinecone_region),
-        )
-        st.info(f"Created Pinecone index '{pinecone_index_name}'.")
-    except Exception as e:
-        st.error(f"❌ Failed to create Pinecone index '{pinecone_index_name}': {e}")
-        st.stop()
-
-pinecone_index = pinecone_client.Index(pinecone_index_name)
 # Paths
 INDEX_DIR = "./rag_store"
 META_PATH = os.path.join(INDEX_DIR, "metadata.json")
@@ -194,6 +150,53 @@ def embed_texts(texts):
     vecs = [r.embedding for r in resp.data]
     arr = np.array(vecs, dtype="float32")
     return arr
+
+
+@st.cache_resource(show_spinner=False)
+def get_pinecone_index():
+    if PINECONE_IMPORT_ERROR:
+        st.error(
+            f"❌ Pinecone SDK not available: {PINECONE_IMPORT_ERROR}. "
+            "Install it with 'pip install pinecone'."
+        )
+        st.stop()
+
+    api_key = os.getenv("PINECONE_API_KEY")
+    if not api_key:
+        st.error("❌ No Pinecone API key found. Set PINECONE_API_KEY in your .env.")
+        st.stop()
+
+    cloud = os.getenv("PINECONE_CLOUD", "aws")
+    region = os.getenv("PINECONE_ENVIRONMENT") or os.getenv("PINECONE_REGION") or "us-east-1"
+    index_name = os.getenv("PINECONE_INDEX_NAME", "hezop-rag")
+
+    client = Pinecone(api_key=api_key)
+    try:
+        listed = client.list_indexes()
+        if hasattr(listed, "names"):
+            existing_indexes = set(listed.names())
+        elif hasattr(listed, "__iter__"):
+            existing_indexes = {getattr(idx, "name", str(idx)) for idx in listed}
+        else:
+            existing_indexes = set()
+    except Exception as err:
+        st.error(f"❌ Failed to list Pinecone indexes: {err}")
+        st.stop()
+
+    if index_name not in existing_indexes:
+        try:
+            client.create_index(
+                name=index_name,
+                dimension=EMBED_DIM,
+                metric="cosine",
+                spec=ServerlessSpec(cloud=cloud, region=region),
+            )
+            st.info(f"Created Pinecone index '{index_name}'.")
+        except Exception as err:
+            st.error(f"❌ Failed to create Pinecone index '{index_name}': {err}")
+            st.stop()
+
+    return client.Index(index_name)
 
 
 def normalize_vectors(arr: np.ndarray) -> np.ndarray:
@@ -332,6 +335,7 @@ def build_or_update_index(force_rebuild=False, translate_if_needed=True, chunk_s
         st.warning("No input files provided and no classified JSON present. Nothing to index.")
         return []
 
+    pinecone_index = get_pinecone_index()
     metas = []
     if force_rebuild:
         try:
@@ -468,6 +472,7 @@ def retrieve(query, topk=6):
     query_vec = embed_query(query)
     if query_vec.size == 0:
         return []
+    pinecone_index = get_pinecone_index()
     try:
         response = pinecone_index.query(
             vector=query_vec.tolist(),
@@ -493,7 +498,7 @@ def retrieve(query, topk=6):
 
 def pinecone_index_ready():
     try:
-        stats = pinecone_index.describe_index_stats()
+        stats = get_pinecone_index().describe_index_stats()
         total_vectors = stats.get("total_vector_count", 0)
         return total_vectors and total_vectors > 0
     except Exception:
@@ -776,7 +781,6 @@ def call_react_agent():
 # ==========================
 # Streamlit UI
 # ==========================
-st.set_page_config(page_title="PID + HAZOP RAG Agent (Auto Input)", layout="wide")
 st.title("🧠 PID + HAZOP RAG Agent (auto-input)")
 
 # show configured input files
