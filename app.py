@@ -8,13 +8,19 @@ import hashlib
 from datetime import datetime
 from difflib import SequenceMatcher
 
-import faiss
 import numpy as np
 import pdfplumber
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 import httpx
+try:
+    from pinecone import Pinecone, ServerlessSpec  # type: ignore[import]
+    PINECONE_IMPORT_ERROR = None
+except ImportError as err:
+    Pinecone = None  # type: ignore[assignment]
+    ServerlessSpec = None  # type: ignore[assignment]
+    PINECONE_IMPORT_ERROR = err
 
 # Try to import translation helper (depends on PyMuPDF / fitz native libs)
 try:
@@ -41,9 +47,55 @@ client = OpenAI(api_key=api_key, http_client=http_client)
 # Embedding model config
 EMBED_MODEL = "text-embedding-3-large"
 EMBED_DIM = 3072  # same as model
+
+# Pinecone client
+if PINECONE_IMPORT_ERROR:
+    st.error(
+        f"❌ Pinecone SDK not available: {PINECONE_IMPORT_ERROR}. "
+        "Install it with 'pip install pinecone-client'."
+    )
+    st.stop()
+pinecone_api_key = os.getenv("PINECONE_API_KEY")
+if not pinecone_api_key:
+    st.error("❌ No Pinecone API key found. Set PINECONE_API_KEY in your .env.")
+    st.stop()
+pinecone_cloud = os.getenv("PINECONE_CLOUD", "aws")
+pinecone_region = (
+    os.getenv("PINECONE_ENVIRONMENT")
+    or os.getenv("PINECONE_REGION")
+    or "us-east-1"
+)
+pinecone_index_name = os.getenv("PINECONE_INDEX_NAME", "hezop-rag")
+
+pinecone_client = Pinecone(api_key=pinecone_api_key)
+try:
+    listed = pinecone_client.list_indexes()
+    if hasattr(listed, "names"):
+        existing_indexes = set(listed.names())
+    elif hasattr(listed, "indexes"):
+        existing_indexes = {getattr(idx, "name", None) for idx in listed.indexes}
+    else:
+        existing_indexes = {getattr(idx, "name", idx) for idx in listed}
+except Exception as e:
+    st.error(f"❌ Failed to list Pinecone indexes: {e}")
+    st.stop()
+
+if pinecone_index_name not in existing_indexes:
+    try:
+        pinecone_client.create_index(
+            name=pinecone_index_name,
+            dimension=EMBED_DIM,
+            metric="cosine",
+            spec=ServerlessSpec(cloud=pinecone_cloud, region=pinecone_region),
+        )
+        st.info(f"Created Pinecone index '{pinecone_index_name}'.")
+    except Exception as e:
+        st.error(f"❌ Failed to create Pinecone index '{pinecone_index_name}': {e}")
+        st.stop()
+
+pinecone_index = pinecone_client.Index(pinecone_index_name)
 # Paths
 INDEX_DIR = "./rag_store"
-INDEX_PATH = os.path.join(INDEX_DIR, "faiss.index")
 META_PATH = os.path.join(INDEX_DIR, "metadata.json")
 CLASSIFIED_JSON = "classified_pipeline_tags2.json"
 os.makedirs(INDEX_DIR, exist_ok=True)
@@ -143,6 +195,21 @@ def embed_texts(texts):
     arr = np.array(vecs, dtype="float32")
     return arr
 
+
+def normalize_vectors(arr: np.ndarray) -> np.ndarray:
+    if arr.size == 0:
+        return arr
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return arr / norms
+
+
+def normalize_vector(vec: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(vec)
+    if norm == 0:
+        return vec
+    return vec / norm
+
 # ==========================
 # Plant JSON loader (same as yours)
 # ==========================
@@ -198,29 +265,19 @@ DATA = load_plant_data()
 # ==========================
 # Index & metadata helpers (dedupe-aware)
 # ==========================
-def load_index_and_metas():
-    if os.path.exists(INDEX_PATH) and os.path.exists(META_PATH):
+def load_metas():
+    if os.path.exists(META_PATH):
         try:
-            idx = faiss.read_index(INDEX_PATH)
-            metas = json.load(open(META_PATH, "r", encoding="utf-8"))
-            return idx, metas
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception as e:
-            st.warning(f"Failed to load existing index/metas: {e}")
-    return None, []
+            st.warning(f"Failed to load metadata cache: {e}")
+    return []
 
-def save_index_and_metas(index, metas):
-    faiss.write_index(index, INDEX_PATH)
+
+def save_metas(metas):
     with open(META_PATH, "w", encoding="utf-8") as f:
         json.dump(metas, f, indent=2)
-
-def ensure_index(dim=EMBED_DIM):
-    """Create a new index if none exists and return it."""
-    idx, metas = load_index_and_metas()
-    if idx is None:
-        idx = faiss.IndexFlatIP(dim)
-        metas = []
-        save_index_and_metas(idx, metas)
-    return idx, metas
 
 def get_existing_file_hashes(metas):
     """Return set of file_hash values present in metadata."""
@@ -262,25 +319,29 @@ def prepare_input_files(input_list):
     return prepared
 
 # ==========================
-# Build / update FAISS index with dedupe
+# Build / update Pinecone index with dedupe
 # ==========================
 def build_or_update_index(force_rebuild=False, translate_if_needed=True, chunk_size=2500):
     """
-    Key behavior:
-    - Loads existing index + metas (if any).
-    - Computes which input files are already present using file_hash in metas.
-    - For new files: extract text, chunk, embed in batches, and append vectors to FAISS index (no full rebuild).
+    - Loads cached metadata (local JSON) for dedupe.
+    - Optionally clears the Pinecone index on force rebuild.
+    - For new files: extract text, chunk, embed, and upsert into Pinecone.
     - Also optionally includes the CLASSIFIED_JSON as a source (only once).
     """
     if not st.session_state.uploaded_files_list and not os.path.exists(CLASSIFIED_JSON):
         st.warning("No input files provided and no classified JSON present. Nothing to index.")
-        return None, None
+        return []
 
-    # load index (or create)
-    index, metas = load_index_and_metas()
-    if index is None or force_rebuild:
-        index = faiss.IndexFlatIP(EMBED_DIM)
-        metas = []
+    metas = []
+    if force_rebuild:
+        try:
+            pinecone_index.delete(delete_all=True)
+            st.info("Cleared Pinecone index before rebuilding.")
+        except Exception as e:
+            st.warning(f"Failed to clear Pinecone index: {e}")
+        save_metas([])
+    else:
+        metas = load_metas()
 
     existing_hashes = get_existing_file_hashes(metas)
 
@@ -291,19 +352,16 @@ def build_or_update_index(force_rebuild=False, translate_if_needed=True, chunk_s
             "or install the Microsoft Visual C++ Redistributable for Visual Studio 2015-2022."
         )
 
-    # collect all new chunks
     new_chunks = []
     for original_path, saved_input_path, translated_path, fh in st.session_state.uploaded_files_list:
         if fh in existing_hashes and not force_rebuild:
             st.info(f"Skipping embedding for {os.path.basename(original_path)} — already indexed.")
             continue
 
-        # translate if requested
         if translate_if_needed and TRANSLATION_AVAILABLE:
             try:
                 if not os.path.exists(translated_path):
                     st.info(f"Translating {original_path} ...")
-                    # your translate_pdf signature: translate_pdf(input_path, translated_path, chunk_size=..., ...)
                     translate_pdf(saved_input_path, translated_path, chunk_size=1000, max_retries=3, timeout=30)
                     st.success(f"Translated: {os.path.basename(original_path)}")
             except Exception as e:
@@ -312,108 +370,134 @@ def build_or_update_index(force_rebuild=False, translate_if_needed=True, chunk_s
         elif translate_if_needed and not TRANSLATION_AVAILABLE:
             translated_path = saved_input_path
 
-        # fallback to original if translated file missing
         src_for_text = translated_path if os.path.exists(translated_path) else saved_input_path
         blocks = extract_pdf_text(src_for_text)
-        # tag each chunk with file_hash for dedupe detection later
         chunks = chunk_texts(blocks, max_chars=chunk_size)
         for c in chunks:
             c["file_hash"] = fh
             c["original_path"] = os.path.basename(original_path)
+            c["chunk_id"] = str(uuid.uuid4())
         new_chunks.extend(chunks)
 
-    # also include classified JSON blocks only if not already included (we tag them with a synthetic hash)
     if os.path.exists(CLASSIFIED_JSON):
         with open(CLASSIFIED_JSON, "r", encoding="utf-8") as f:
             plant_data = json.load(f)
         classified_blocks = json_to_blocks(plant_data)
-        # synthetic hash for classified json (use file modified time)
         try:
             mtime = os.path.getmtime(CLASSIFIED_JSON)
             cj_hash = hashlib.sha256(f"{CLASSIFIED_JSON}-{mtime}".encode()).hexdigest()
-        except:
+        except Exception:
             cj_hash = hashlib.sha256(CLASSIFIED_JSON.encode()).hexdigest()
         if cj_hash not in existing_hashes or force_rebuild:
             for b in classified_blocks:
                 b["file_hash"] = cj_hash
                 b["original_path"] = os.path.basename(CLASSIFIED_JSON)
+                b["chunk_id"] = str(uuid.uuid4())
             new_chunks.extend(classified_blocks)
         else:
             st.info("Classified JSON already indexed — skipping.")
 
     if not new_chunks:
         st.success("Index is up-to-date. Nothing new to embed.")
-        # return loaded index and metas if available
-        if index is not None and metas is not None and len(metas) > 0:
+        if metas:
             st.session_state.index_built = True
-            return index, metas
-        else:
-            return None, None
+        return metas
 
-    # embed in batches (to avoid huge single request)
     BATCH = 16
-    text_batches = [new_chunks[i:i+BATCH] for i in range(0, len(new_chunks), BATCH)]
-    vectors_to_add = []
+    text_batches = [new_chunks[i:i + BATCH] for i in range(0, len(new_chunks), BATCH)]
     new_metas = []
+    upserted = 0
+
     for batch in text_batches:
         texts = [c["text"] for c in batch]
         arr = embed_texts(texts)
+        arr = normalize_vectors(arr)
         if arr.size == 0:
             continue
-        # normalize vectors for cosine similarity using inner product
-        faiss.normalize_L2(arr)
-        vectors_to_add.append(arr)
-        # build metas for these chunks
-        for i, c in enumerate(batch):
+
+        items = []
+        batch_metas = []
+        for vec, c in zip(arr, batch):
             meta = {
-                "chunk_id": str(uuid.uuid4()),
+                "chunk_id": c["chunk_id"],
                 "text": c["text"],
                 "source": c.get("source", c.get("original_path", "unknown")),
                 "page": c.get("page"),
                 "created": datetime.utcnow().isoformat(),
                 "file_hash": c.get("file_hash"),
+                "original_path": c.get("original_path"),
             }
-            new_metas.append(meta)
+            items.append(
+                {
+                    "id": c["chunk_id"],
+                    "values": vec.tolist(),
+                    "metadata": meta,
+                }
+            )
+            batch_metas.append(meta)
 
-    # finally add vectors to index (append)
-    if vectors_to_add:
-        all_new = np.vstack(vectors_to_add)
-        if index.ntotal == 0:
-            # index is empty - create and add
-            index.add(all_new)
-        else:
-            index.add(all_new)
+        try:
+            pinecone_index.upsert(items=items)
+            upserted += len(items)
+            new_metas.extend(batch_metas)
+        except Exception as e:
+            st.error(f"Failed to upsert batch into Pinecone: {e}")
 
-        # extend metas list and save
+    if upserted > 0:
         metas.extend(new_metas)
-        save_index_and_metas(index, metas)
-        st.success(f"Added {len(new_metas)} chunks to FAISS index.")
+        save_metas(metas)
+        st.success(f"Added {upserted} chunks to Pinecone index.")
         st.session_state.index_built = True
-        return index, metas
+    else:
+        st.warning("No chunks were added to Pinecone.")
 
-    return None, None
+    return metas
 
 # ==========================
 # Retrieval & agentic tool
 # ==========================
 def embed_query(q):
     emb = client.embeddings.create(input=q, model=EMBED_MODEL).data[0].embedding
-    v = np.array(emb, dtype="float32").reshape(1, -1)
-    faiss.normalize_L2(v)
-    return v
+    v = np.array(emb, dtype="float32")
+    return normalize_vector(v)
 
-def retrieve(index, metas, query, topk=6):
-    if index is None or metas is None or index.ntotal == 0:
+
+def retrieve(query, topk=6):
+    if topk <= 0:
         return []
-    v = embed_query(query)
-    D, I = index.search(v, topk)
+    query_vec = embed_query(query)
+    if query_vec.size == 0:
+        return []
+    try:
+        response = pinecone_index.query(
+            vector=query_vec.tolist(),
+            top_k=topk,
+            include_metadata=True,
+        )
+    except Exception as e:
+        st.warning(f"Failed to query Pinecone index: {e}")
+        return []
+
+    matches = response.get("matches") or []
     results = []
-    for n, i in enumerate(I[0]):
-        if i >= 0 and i < len(metas):
-            meta = metas[i]
-            score = float(D[0][n])
-            results.append((meta, score))
+    for match in matches:
+        meta = match.get("metadata") or {}
+        score = match.get("score")
+        try:
+            score = float(score) if score is not None else None
+        except Exception:
+            score = None
+        results.append((meta, score))
     return results
+
+
+def pinecone_index_ready():
+    try:
+        stats = pinecone_index.describe_index_stats()
+        total_vectors = stats.get("total_vector_count", 0)
+        return total_vectors and total_vectors > 0
+    except Exception:
+        return False
 
 # Minimal local context builders (kept from original code)
 def find_best_tag_matches(query, data_list, threshold=0.6):
@@ -566,8 +650,7 @@ def get_react_context(question: str, top_k: int = 6) -> str:
     summary = summarize_context(local_context)
 
     # retrieve from vector store
-    idx, metas = load_index_and_metas()
-    retrieved = retrieve(idx, metas, question, topk=top_k) if idx is not None else []
+    retrieved = retrieve(question, topk=top_k)
     if retrieved:
         retrieve_lines = ["Retrieved references:"]
         for meta, score in retrieved:
@@ -722,28 +805,20 @@ col1, col2, col3 = st.sidebar.columns([1,1,1])
 with col1:
     if st.button("▶️ Build / Update Index"):
         with st.spinner("Building or updating index (dedupe-aware)..."):
-            idx, metas = build_or_update_index(force_rebuild=False, translate_if_needed=True)
-            if idx is not None:
+            metas = build_or_update_index(force_rebuild=False, translate_if_needed=True)
+            if metas:
                 st.success("Index ready.")
             else:
-                st.warning("Index build/update did not produce an index.")
+                st.warning("Index build/update did not add any new chunks.")
 with col2:
     if st.button("🔁 Force Rebuild Index"):
         with st.spinner("Force rebuilding full index..."):
-            # force: remove existing files then rebuild
-            try:
-                if os.path.exists(INDEX_PATH):
-                    os.remove(INDEX_PATH)
-                if os.path.exists(META_PATH):
-                    os.remove(META_PATH)
-            except Exception as e:
-                st.warning(f"Could not remove existing store: {e}")
-            idx, metas = build_or_update_index(force_rebuild=True, translate_if_needed=True)
-            if idx:
+            metas = build_or_update_index(force_rebuild=True, translate_if_needed=True)
+            if metas:
                 st.success("Index force-rebuilt.")
 with col3:
     if st.button("🧾 Show metadata summary"):
-        idx, metas = load_index_and_metas()
+        metas = load_metas()
         if metas:
             st.write(f"Total chunks: {len(metas)}")
             # show top 5 metas
@@ -751,13 +826,15 @@ with col3:
         else:
             st.info("No metadata found yet.")
 
-# Load index in memory for chat if available
-index, metas = load_index_and_metas()
+# Load metadata cache to decide whether index is populated
+metas = load_metas()
 
-if index is None or len(metas) == 0:
+if not metas and not pinecone_index_ready():
     st.warning("⚠️ No vector index available. Build/update index first (sidebar).")
     st.info("Use 'Build / Update Index' to embed configured files automatically.")
 else:
+    if not metas:
+        st.info("Metadata cache empty — relying on Pinecone index metadata only.")
     # chat interface
     user_q = st.chat_input("Ask about pipelines, equipment, instruments, or HAZOP findings...")
     if user_q:
