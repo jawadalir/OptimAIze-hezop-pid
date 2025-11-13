@@ -350,10 +350,10 @@ def build_or_update_index(force_rebuild=False, translate_if_needed=True, chunk_s
     existing_hashes = get_existing_file_hashes(metas)
 
     if translate_if_needed and not TRANSLATION_AVAILABLE:
-        st.warning(
-            "PDF translation disabled because the translation module failed to import.\n"
-            "Please reinstall PyMuPDF (pip install --force-reinstall PyMuPDF==1.24.10) "
-            "or install the Microsoft Visual C++ Redistributable for Visual Studio 2015-2022."
+        st.info(
+            "Optional PDF translation is disabled because the translation helper (PyMuPDF + reportlab + deep-translator) "
+            "is not installed. The app will continue with original PDFs. Install these packages if you need on-the-fly "
+            "Dutch → English translation."
         )
 
     new_chunks = []
