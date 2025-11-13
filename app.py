@@ -13,13 +13,17 @@ import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 import httpx
-try:
-    from pinecone import Pinecone, ServerlessSpec
-    PINECONE_IMPORT_ERROR = None
-except ImportError as err:
-    Pinecone = None  # type: ignore[assignment]
-    ServerlessSpec = None  # type: ignore[assignment]
-    PINECONE_IMPORT_ERROR = err
+
+from embedding import (
+    PINECONE_IMPORT_ERROR,
+    get_pinecone_index,
+    get_existing_file_hashes,
+    load_metas,
+    normalize_vector,
+    normalize_vectors,
+    pinecone_index_ready,
+    save_metas,
+)
 
 # Try to import translation helper (depends on PyMuPDF / fitz native libs)
 try:
@@ -150,69 +154,6 @@ def embed_texts(texts):
     vecs = [r.embedding for r in resp.data]
     arr = np.array(vecs, dtype="float32")
     return arr
-
-
-@st.cache_resource(show_spinner=False)
-def get_pinecone_index():
-    if PINECONE_IMPORT_ERROR:
-        st.error(
-            f"❌ Pinecone SDK not available: {PINECONE_IMPORT_ERROR}. "
-            "Install it with 'pip install pinecone'."
-        )
-        st.stop()
-
-    api_key = os.getenv("PINECONE_API_KEY")
-    if not api_key:
-        st.error("❌ No Pinecone API key found. Set PINECONE_API_KEY in your .env.")
-        st.stop()
-
-    cloud = os.getenv("PINECONE_CLOUD", "aws")
-    region = os.getenv("PINECONE_ENVIRONMENT") or os.getenv("PINECONE_REGION") or "us-east-1"
-    index_name = os.getenv("PINECONE_INDEX_NAME", "hezop-rag")
-
-    client = Pinecone(api_key=api_key)
-    try:
-        listed = client.list_indexes()
-        if hasattr(listed, "names"):
-            existing_indexes = set(listed.names())
-        elif hasattr(listed, "__iter__"):
-            existing_indexes = {getattr(idx, "name", str(idx)) for idx in listed}
-        else:
-            existing_indexes = set()
-    except Exception as err:
-        st.error(f"❌ Failed to list Pinecone indexes: {err}")
-        st.stop()
-
-    if index_name not in existing_indexes:
-        try:
-            client.create_index(
-                name=index_name,
-                dimension=EMBED_DIM,
-                metric="cosine",
-                spec=ServerlessSpec(cloud=cloud, region=region),
-            )
-            st.info(f"Created Pinecone index '{index_name}'.")
-        except Exception as err:
-            st.error(f"❌ Failed to create Pinecone index '{index_name}': {err}")
-            st.stop()
-
-    return client.Index(index_name)
-
-
-def normalize_vectors(arr: np.ndarray) -> np.ndarray:
-    if arr.size == 0:
-        return arr
-    norms = np.linalg.norm(arr, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return arr / norms
-
-
-def normalize_vector(vec: np.ndarray) -> np.ndarray:
-    norm = np.linalg.norm(vec)
-    if norm == 0:
-        return vec
-    return vec / norm
-
 # ==========================
 # Plant JSON loader (same as yours)
 # ==========================
@@ -266,32 +207,6 @@ def load_plant_data():
 DATA = load_plant_data()
 
 # ==========================
-# Index & metadata helpers (dedupe-aware)
-# ==========================
-def load_metas():
-    if os.path.exists(META_PATH):
-        try:
-            with open(META_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            st.warning(f"Failed to load metadata cache: {e}")
-    return []
-
-
-def save_metas(metas):
-    with open(META_PATH, "w", encoding="utf-8") as f:
-        json.dump(metas, f, indent=2)
-
-def get_existing_file_hashes(metas):
-    """Return set of file_hash values present in metadata."""
-    hashes = set()
-    for m in metas:
-        fh = m.get("file_hash")
-        if fh:
-            hashes.add(fh)
-    return hashes
-
-# ==========================
 # Input files processing (auto ingest)
 # ==========================
 def prepare_input_files(input_list):
@@ -335,7 +250,7 @@ def build_or_update_index(force_rebuild=False, translate_if_needed=True, chunk_s
         st.warning("No input files provided and no classified JSON present. Nothing to index.")
         return []
 
-    pinecone_index = get_pinecone_index()
+    pinecone_index = get_pinecone_index(EMBED_DIM)
     metas = []
     if force_rebuild:
         try:
@@ -343,17 +258,17 @@ def build_or_update_index(force_rebuild=False, translate_if_needed=True, chunk_s
             st.info("Cleared Pinecone index before rebuilding.")
         except Exception as e:
             st.warning(f"Failed to clear Pinecone index: {e}")
-        save_metas([])
+        save_metas(META_PATH, [])
     else:
-        metas = load_metas()
+        metas = load_metas(META_PATH)
 
     existing_hashes = get_existing_file_hashes(metas)
 
     if translate_if_needed and not TRANSLATION_AVAILABLE:
-        st.warning(
-            "PDF translation disabled because the translation module failed to import.\n"
-            "Please reinstall PyMuPDF (pip install --force-reinstall PyMuPDF==1.24.10) "
-            "or install the Microsoft Visual C++ Redistributable for Visual Studio 2015-2022."
+        st.info(
+            "Optional PDF translation is disabled because the translation helper (PyMuPDF + reportlab + deep-translator) "
+            "is not installed. The app will continue with original PDFs. Install these packages if you need on-the-fly "
+            "Dutch → English translation."
         )
 
     new_chunks = []
@@ -449,7 +364,7 @@ def build_or_update_index(force_rebuild=False, translate_if_needed=True, chunk_s
 
     if upserted > 0:
         metas.extend(new_metas)
-        save_metas(metas)
+        save_metas(META_PATH, metas)
         st.success(f"Added {upserted} chunks to Pinecone index.")
         st.session_state.index_built = True
     else:
@@ -472,7 +387,7 @@ def retrieve(query, topk=6):
     query_vec = embed_query(query)
     if query_vec.size == 0:
         return []
-    pinecone_index = get_pinecone_index()
+    pinecone_index = get_pinecone_index(EMBED_DIM)
     try:
         response = pinecone_index.query(
             vector=query_vec.tolist(),
@@ -494,16 +409,6 @@ def retrieve(query, topk=6):
             score = None
         results.append((meta, score))
     return results
-
-
-def pinecone_index_ready():
-    try:
-        stats = get_pinecone_index().describe_index_stats()
-        total_vectors = stats.get("total_vector_count", 0)
-        return total_vectors and total_vectors > 0
-    except Exception:
-        return False
-
 # Minimal local context builders (kept from original code)
 def find_best_tag_matches(query, data_list, threshold=0.6):
     results = []
@@ -822,7 +727,7 @@ with col2:
                 st.success("Index force-rebuilt.")
 with col3:
     if st.button("🧾 Show metadata summary"):
-        metas = load_metas()
+        metas = load_metas(META_PATH)
         if metas:
             st.write(f"Total chunks: {len(metas)}")
             # show top 5 metas
@@ -831,9 +736,9 @@ with col3:
             st.info("No metadata found yet.")
 
 # Load metadata cache to decide whether index is populated
-metas = load_metas()
+metas = load_metas(META_PATH)
 
-if not metas and not pinecone_index_ready():
+if not metas and not pinecone_index_ready(EMBED_DIM):
     st.warning("⚠️ No vector index available. Build/update index first (sidebar).")
     st.info("Use 'Build / Update Index' to embed configured files automatically.")
 else:
